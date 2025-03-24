@@ -492,8 +492,8 @@ def parse_arguments():
         "-m",
         "--model",
         type=str,
-        default="best_model_20k.pth",
-        help="Path to the trained model checkpoint (default: best_model_20k.pth).",
+        default="best_model.pth",
+        help="Path to the trained model checkpoint (default: best_model.pth).",
     )
     parser.add_argument(
         "--topk", action="store_true", help="Use top-k sampling for caption generation."
@@ -521,12 +521,12 @@ def parse_arguments():
     )
     # Hyperparameter defaults
     default_values = {
-        "max_length": 30,
-        "embed_dim": 128,
-        "num_heads": 4,
-        "hidden_dim": 128,
-        "num_layers": 2,
-        "dropout": 0.2,
+        "max_length": 50,
+        "embed_dim": 256,
+        "num_heads": 8,
+        "hidden_dim": 1024,
+        "num_layers": 4,
+        "dropout": 0.3,
         "feature_dim": 960,
         "vocab_size": 0
     }
@@ -587,7 +587,6 @@ def parse_arguments():
 def inference():
     args = parse_arguments()
     print("Welcome to Image Caption Inference!")
-    print("Welcome to Image Caption Inference!")
     CAMERA_TIMEOUT = args.timeout
     IMAGE_PATH = args.image
     MODEL_CHECKPOINT = args.model
@@ -604,16 +603,20 @@ def inference():
     feature_dim = args.feature_dim
     vocab_size = tokenizer.vocab_size if args.vocab_size == 0 else args.vocab_size
 
-    # embed_dim = 128
-    # num_heads = 4
-    # hidden_dim = 128
-    # num_layers = 2
-    # dropout = 0.2
+    # embed_dim = 256
+    # num_heads = 8
+    # hidden_dim = 1024
+    # num_layers = 4
+    # dropout = 0.3
     # feature_dim = 960
     # vocab_size = tokenizer.vocab_size
     device = args.device
-    tokenizer = AutoTokenizer.from_pretrained("nemotron_tokenizer")
-    print("Tokenizer loaded")
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    tokenizer.bos_token = "[CLS]"
+    tokenizer.eos_token = "[SEP]"
+    tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids("[CLS]")
+    tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids("[SEP]")
+
     print("Tokenizer loaded")
 
     encoder = MobileNetV3Encoder()
@@ -624,17 +627,11 @@ def inference():
         vocab_size=vocab_size,
         num_layers=num_layers,
         max_length=max_length,
-        max_length=max_length,
         feature_dim=feature_dim,
         dropout=dropout,
     )
     model = ImageCaptionModel(encoder, decoder)
 
-    model.load_state_dict(
-        torch.load(
-            MODEL_CHECKPOINT, weights_only=True, map_location=torch.device(device)
-        )
-    )
     model.load_state_dict(
         torch.load(
             MODEL_CHECKPOINT, weights_only=True, map_location=torch.device(device)
@@ -647,7 +644,6 @@ def inference():
         model,
         tokenizer,
         device,
-        max_length=max_length,
         max_length=max_length,
         top_k=args.topk,
         nucleus=args.nucleus,
