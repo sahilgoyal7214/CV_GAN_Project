@@ -402,14 +402,17 @@ def generate_caption_for_image(
         caption2 = ""
         caption3 = ""
         if top_k:
+            print("Top-k sampling decoding...")
             caption1 = top_k_sampling_decode(
                 encoder_features, model, tokenizer, device, max_length=max_length
             )
         if nucleus:
+            print("Nucleus sampling decoding...")
             caption2 = nucleus_sampling_decode(
                 encoder_features, model, tokenizer, device, max_length=max_length
             )
         if beam:
+            print("Beam search decoding...")
             caption3 = beam_search_decode(
                 encoder_features, model, tokenizer, device, max_length=max_length
             )
@@ -452,6 +455,7 @@ def text_to_speech(text, filename="output.mp3"):
     engine.save_to_file(text, filename)
     engine.runAndWait()
     print(f"Audio saved as {filename}")
+
 
 def parse_arguments():
     """
@@ -506,47 +510,107 @@ def parse_arguments():
         help="Device to run the model on (options: 'cpu', 'cuda'). Default is 'cpu'.",
     )
     parser.add_argument(
-        "--audio","-a",action="store_true",help="Convert the generated caption to audio."
+        "--audio",
+        "-a",
+        action="store_true",
+        help="Convert the generated caption to audio.",
     )
+    # Hyperparameter defaults
+    default_values = {
+        "max_length": 30,
+        "embed_dim": 128,
+        "num_heads": 4,
+        "hidden_dim": 128,
+        "num_layers": 2,
+        "dropout": 0.2,
+        "feature_dim": 960,
+        "vocab_size": 0
+    }
+
+    # Single argument for all hyperparameters
+    param_names = list(default_values.keys())
+    parser.add_argument(
+        "--hyperparameter",
+        nargs="*",
+        type=float,
+        help=f"Provide model hyperparameters in order: {', '.join(param_names)}",
+    )
+
+    # Key-value override arguments
+    for param in param_names:
+        parser.add_argument(
+            f"--{param.lower()}", type=float, help=f"Override {param} value"
+        )
+
     args = parser.parse_args()
+
+    # Apply `--hyperparameter` values in order (fill missing ones with defaults)
+    provided_hyperparams = args.hyperparameter or []
+    for i, param in enumerate(param_names):
+        if i < len(provided_hyperparams):
+            default_values[param] = provided_hyperparams[i]
+
+    # Apply key-value overrides
+    for param in param_names:
+        value = getattr(args, param.lower())  # Get key-value arg if provided
+        if value is not None:
+            default_values[param] = value
+
+    # Store hyperparameters in `args`
+    for param, value in default_values.items():
+        setattr(args, param, value)
 
     return args
 
+
 def inference():
     args = parse_arguments()
-
+    print("Welcome to Image Caption Inference!")
     CAMERA_TIMEOUT = args.timeout
     IMAGE_PATH = args.image
     MODEL_CHECKPOINT = args.model
     if args.image is None:
         IMAGE_PATH = "captured_image.jpg"
         capture_image(IMAGE_PATH, CAMERA_TIMEOUT)
+    print("Image loaded from ", IMAGE_PATH)
+    max_length = args.max_length
+    embed_dim = args.embed_dim
+    num_heads = args.num_heads
+    hidden_dim = args.hidden_dim
+    num_layers = args.num_layers
+    dropout = args.dropout
+    feature_dim = args.feature_dim
+    vocab_size = tokenizer.vocab_size if args.vocab_size == 0 else args.vocab_size
 
-    MAX_LENGTH = 30
-    embed_dim = 128
-    num_heads = 4
-    hidden_dim = 128
-    num_layers = 2
-    dropout = 0.2
-    feature_dim = 960
-
+    # embed_dim = 128
+    # num_heads = 4
+    # hidden_dim = 128
+    # num_layers = 2
+    # dropout = 0.2
+    # feature_dim = 960
+    # vocab_size = tokenizer.vocab_size
     device = args.device
     tokenizer = AutoTokenizer.from_pretrained("nemotron_tokenizer")
+    print("Tokenizer loaded")
 
     encoder = MobileNetV3Encoder()
     decoder = TransformerDecoder(
         embed_dim=embed_dim,
         num_heads=num_heads,
         hidden_dim=hidden_dim,
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=vocab_size,
         num_layers=num_layers,
-        max_length=MAX_LENGTH,
+        max_length=max_length,
         feature_dim=feature_dim,
         dropout=dropout,
     )
     model = ImageCaptionModel(encoder, decoder)
 
-    model.load_state_dict(torch.load(MODEL_CHECKPOINT, weights_only=True, map_location=torch.device(device)))
+    model.load_state_dict(
+        torch.load(
+            MODEL_CHECKPOINT, weights_only=True, map_location=torch.device(device)
+        )
+    )
     print("Loaded model from", MODEL_CHECKPOINT)
 
     caption1, caption2, caption3 = generate_caption_for_image(
@@ -554,7 +618,7 @@ def inference():
         model,
         tokenizer,
         device,
-        MAX_LENGTH,
+        max_length=max_length,
         top_k=args.topk,
         nucleus=args.nucleus,
         beam=args.beam,
@@ -576,7 +640,7 @@ def inference():
             text = "Please specify a decoding strategy: top-k, nucleus, or beam."
             text_to_speech(text)
             print(text)
-    else :
+    else:
         if args.topk:
             print("Generated Caption (top-k):", caption1)
         if args.nucleus:
