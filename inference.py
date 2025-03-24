@@ -577,9 +577,14 @@ def inference():
             text_to_speech(text)
             print(text)
     else :
-        print("Generated Caption (top-k):", caption1)
-        print("Generated Caption (nucleus):", caption2)
-        print("Generated Caption (beam):", caption3)
+        if args.topk:
+            print("Generated Caption (top-k):", caption1)
+        if args.nucleus:
+            print("Generated Caption (nucleus):", caption2)
+        if args.beam:
+            print("Generated Caption (beam):", caption3)
+        if not args.topk and not args.nucleus and not args.beam:
+            print("Please specify a decoding strategy: top-k, nucleus, or beam.")
 
 
 if __name__ == "__main__":
