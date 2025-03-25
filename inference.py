@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torchvision import transforms, models
-from torchvision.models import MobileNet_V3_Large_Weights
+from torchvision.models import EfficientNet_B4_Weights
 from transformers import AutoTokenizer
 from PIL import Image
 import math
@@ -13,38 +13,29 @@ import pyttsx3
 
 
 # --- Encoder ---
-class MobileNetV3Encoder(nn.Module):
+class EfficientNetEncoder(nn.Module):
     def __init__(self):
-        super(MobileNetV3Encoder, self).__init__()
-        mobilenet = models.mobilenet_v3_large(
-            weights=MobileNet_V3_Large_Weights.IMAGENET1K_V1
-        )
-        # Use the convolutional features only
-        self.features = mobilenet.features
-
+        super(EfficientNetEncoder, self).__init__()
+        # Load pretrained EfficientNet-B4 model
+        efficientnet = models.efficientnet_b4(weights=EfficientNet_B4_Weights.IMAGENET1K_V1)
+        # Use the convolutional features (exclude the classification head)
+        self.features = efficientnet.features  
+        # Optionally, add adaptive pooling to get fixed spatial dimensions
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
+        
     def forward(self, images):
         features = self.features(images)  # shape: (batch, C, H, W)
+        features = self.pool(features)      # shape: (batch, C, 7, 7)
         batch, C, H, W = features.shape
         # Flatten spatial dimensions: each image becomes a sequence of (H*W) tokens
-        features = features.view(batch, C, H * W)  # (batch, C, H*W)
-        features = features.transpose(1, 2)  # (batch, H*W, C)
-        return features  # e.g., (batch, 49, 960) for a 7x7 feature map
+        features = features.view(batch, C, H * W)  # (batch, C, 49)
+        features = features.transpose(1, 2)        # (batch, 49, C)
+        return features  # e.g., (batch, 49, feature_dim)
 
 
 # --- Decoder with Spatial Attention and Teacher Forcing ---
 class TransformerDecoder(nn.Module):
-    def __init__(
-        self,
-        embed_dim,
-        num_heads,
-        hidden_dim,
-        vocab_size,
-        num_layers,
-        max_length,
-        feature_dim,
-        dropout,
-        num_image_tokens=49,
-    ):
+    def __init__(self, embed_dim, num_heads, hidden_dim, vocab_size, num_layers, max_length, feature_dim, dropout, num_image_tokens=49):
         """
         Args:
             embed_dim: Embedding dimension for target tokens.
@@ -54,52 +45,46 @@ class TransformerDecoder(nn.Module):
             num_layers: Number of transformer decoder layers.
             max_length: Maximum length for target sequences.
             feature_dim: Dimension of encoder output channels.
-            num_image_tokens: Number of spatial tokens from the encoder (e.g., 7x7=49).
             dropout: Dropout rate.
+            num_image_tokens: Number of spatial tokens from the encoder (e.g., 7x7=49).
         """
         super(TransformerDecoder, self).__init__()
         self.embed_dim = embed_dim
         self.max_length = max_length
-
-        # Embedding layer for target tokens.
+        
+        # Token embedding for target captions.
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.dropout = nn.Dropout(dropout)
-
-        # Sinusoidal positional encoding for target tokens.
-        self.register_buffer(
-            "positional_encoding",
-            self._generate_positional_encoding(max_length, embed_dim),
+        self.register_buffer('positional_encoding', self._generate_positional_encoding(max_length, embed_dim))
+        
+        # Project encoder's spatial features to decoder embedding space.
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, embed_dim),
+            nn.LayerNorm(embed_dim)  # Normalize features for stability
         )
-
-        # Project encoder's spatial features to the decoder embedding space.
-        self.feature_proj = nn.Linear(feature_dim, embed_dim)
-
-        # Learnable positional embedding for image spatial tokens.
-        self.image_pos_embedding = nn.Parameter(
-            torch.randn(1, num_image_tokens, embed_dim)
-        )
-
-        # Transformer decoder (batch_first=True).
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_layers
-        )
-
-        # Final linear layer to map decoder outputs to vocabulary logits.
+        
+        # Learnable positional embeddings for image tokens.
+        self.image_pos_embedding = nn.Parameter(torch.randn(1, num_image_tokens, embed_dim))
+        
+        # Extra Transformer encoder block for image features
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True)
+        self.image_feature_encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        
+        # Transformer decoder layers.
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, dropout=dropout, batch_first=True)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        
+        # Final output projection.
         self.fc_out = nn.Linear(embed_dim, vocab_size)
+
+        # Final layer norm for stability
+        self.layer_norm = nn.LayerNorm(embed_dim)
+
 
     def _generate_positional_encoding(self, max_len, d_model):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)  # (1, max_len, d_model)
@@ -108,9 +93,8 @@ class TransformerDecoder(nn.Module):
         """Generates a causal mask (upper-triangular) for target tokens."""
         return torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
 
-    def forward(
-        self, encoder_features, tgt_input, tgt_mask=None, tgt_key_padding_mask=None
-    ):
+
+    def forward(self, encoder_features, tgt_input, tgt_mask=None, tgt_key_padding_mask=None):
         """
         Args:
             encoder_features: Output from encoder, shape (batch, num_image_tokens, feature_dim).
@@ -120,31 +104,25 @@ class TransformerDecoder(nn.Module):
         Returns:
             Logits for each target token, shape (batch, tgt_seq_len, vocab_size).
         """
-        # Project and add learnable positional embedding to the image features.
-        memory = (
-            self.feature_proj(encoder_features) + self.image_pos_embedding
-        )  # (batch, num_image_tokens, embed_dim)
-
-        # Embed target tokens and add sinusoidal positional encoding.
+        # Project encoder features and add image positional embeddings.
+        memory = self.feature_proj(encoder_features) + self.image_pos_embedding  # (batch, num_image_tokens, embed_dim)
+        # Process image features through an extra encoder block.
+        memory = self.image_feature_encoder(memory)
+        
+        # Embed target tokens and add positional encoding.
         tgt_embedded = self.embedding(tgt_input) * math.sqrt(self.embed_dim)
         seq_len = tgt_input.size(1)
         pos_enc = self.positional_encoding[:, :seq_len, :].to(tgt_input.device)
         tgt_embedded = tgt_embedded + pos_enc
         tgt_embedded = self.dropout(tgt_embedded)
-
-        # Generate causal mask if not provided.
+        
+        # Create causal mask if needed.
         if tgt_mask is None:
-            tgt_mask = self.generate_square_subsequent_mask(seq_len).to(
-                tgt_input.device
-            )
-
-        # Transformer decoder processing.
-        decoder_output = self.transformer_decoder(
-            tgt_embedded,
-            memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-        )
+            tgt_mask = self.generate_square_subsequent_mask(seq_len).to(tgt_input.device)
+        
+        # Pass through Transformer decoder.
+        decoder_output = self.transformer_decoder(tgt_embedded, memory, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
+        decoder_output = self.layer_norm(decoder_output)
         logits = self.fc_out(decoder_output)
         return logits
 
@@ -158,29 +136,12 @@ class ImageCaptionModel(nn.Module):
         self.use_features = use_features
 
     def forward(self, x, tgt_input, tgt_mask=None, tgt_key_padding_mask=None):
-        """
-        Forward pass for the image captioning model.
-
-        Args:
-            x: Input data, either an image tensor or precomputed features.
-            tgt_input: Tokenized target sequence (e.g., captions) for the decoder.
-            tgt_mask: Optional causal mask for the target sequence.
-            tgt_key_padding_mask: Optional padding mask for target tokens.
-
-        Returns:
-            outputs: Logits for each target token, shape (batch, tgt_seq_len, vocab_size).
-        """
-
+        # If features are precomputed, x is already the encoder output.
         if self.use_features:
             features = x
         else:
             features = self.encoder(x)
-        outputs = self.decoder(
-            features,
-            tgt_input,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-        )
+        outputs = self.decoder(features, tgt_input, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
         return outputs
 
 
@@ -359,7 +320,6 @@ def beam_search_decode(
     return caption
 
 
-
 def generate_caption_for_image(
     image_path,
     model,
@@ -389,13 +349,8 @@ def generate_caption_for_image(
 
     print("\n🚀 Generating captions for the given image...\n")  # Initial message
 
-    transform = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    weights = EfficientNet_B4_Weights.IMAGENET1K_V1
+    transform = weights.transforms()
     image = Image.open(image_path).convert("RGB")
     image = transform(image).unsqueeze(0).to(device)
 
@@ -460,7 +415,6 @@ def text_to_speech(text, filename="output.mp3"):
     print(f"Audio saved as {filename}")
 
 
-
 def parse_arguments():
     """
     Parse command line arguments for image captioning inference.
@@ -522,13 +476,12 @@ def parse_arguments():
     # Hyperparameter defaults
     default_values = {
         "max_length": 50,
-        "embed_dim": 256,
+        "embed_dim": 512,
         "num_heads": 8,
-        "hidden_dim": 1024,
-        "num_layers": 4,
-        "dropout": 0.3,
-        "feature_dim": 960,
-        "vocab_size": 0
+        "hidden_dim": 2048,
+        "num_layers": 6,
+        "dropout": 0.2,
+        "feature_dim": 1792,
     }
 
     # Single argument for all hyperparameters
@@ -583,7 +536,6 @@ def parse_arguments():
     return args
 
 
-
 def inference():
     args = parse_arguments()
     print("Welcome to Image Caption Inference!")
@@ -601,7 +553,6 @@ def inference():
     num_layers = args.num_layers
     dropout = args.dropout
     feature_dim = args.feature_dim
-    vocab_size = tokenizer.vocab_size if args.vocab_size == 0 else args.vocab_size
 
     # embed_dim = 256
     # num_heads = 8
@@ -617,14 +568,15 @@ def inference():
     tokenizer.bos_token_id = tokenizer.convert_tokens_to_ids("[CLS]")
     tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids("[SEP]")
 
+  
     print("Tokenizer loaded")
 
-    encoder = MobileNetV3Encoder()
+    encoder = EfficientNetEncoder()
     decoder = TransformerDecoder(
         embed_dim=embed_dim,
         num_heads=num_heads,
         hidden_dim=hidden_dim,
-        vocab_size=vocab_size,
+        vocab_size=tokenizer.vocab_size ,
         num_layers=num_layers,
         max_length=max_length,
         feature_dim=feature_dim,
